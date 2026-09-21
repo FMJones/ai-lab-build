@@ -347,6 +347,8 @@ jobs:
   finalizza:
     name: Chiudi la build
     needs: build
+    # "bozza" si salta su main: senza always() saltano a cascata anche i suoi dipendenti.
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.SORGENTI_TOKEN }}
