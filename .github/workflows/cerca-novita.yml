@@ -1,0 +1,76 @@
+name: Cerca novità
+
+# Ogni mezz'ora guarda se nel repository dei sorgenti (privato) c'è qualcosa
+# da costruire e, se sì, avvia "Build installer". Una sola build per volta:
+#   1. il tag di versione più recente, se non ha ancora una release pubblicata;
+#   2. altrimenti l'ultimo commit di main (build di prova).
+# Ogni commit o tag si costruisce una sola volta: fa fede l'elenco delle
+# esecuzioni già fatte qui. "ripeti" costruisce di nuovo anche quelle fallite.
+# Da mano: gh workflow run cerca-novita.yml -R FMJones/ai-lab-build
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      ripeti:
+        description: "Riprova anche le build già fallite"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+
+concurrency:
+  group: cerca-novita
+  cancel-in-progress: false
+
+env:
+  SORGENTI: FMJones/ai-lab
+
+jobs:
+  cerca:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cerca e avvia
+        env:
+          TOKEN_SORGENTI: ${{ secrets.SORGENTI_TOKEN }}
+          TOKEN_BUILD: ${{ github.token }}
+          RIPETI: ${{ inputs.ripeti }}
+        run: |
+          set -euo pipefail
+          s() { GH_TOKEN="$TOKEN_SORGENTI" gh "$@"; }
+          b() { GH_TOKEN="$TOKEN_BUILD" gh "$@"; }
+
+          # Titoli delle esecuzioni già fatte o in corso ("Build <ref> <sha>").
+          if [ "$RIPETI" = "true" ]; then
+            FILTRO='select(.conclusion!="cancelled" and .conclusion!="failure")'
+          else
+            FILTRO='select(.conclusion!="cancelled")'
+          fi
+          FATTE=$(b run list --repo "$GITHUB_REPOSITORY" --workflow build.yml -L 100 \
+                    --json displayTitle,conclusion --jq ".[] | $FILTRO | .displayTitle")
+
+          avvia() {  # ref sha7
+            echo "Avvio la build di $1 ($2)"
+            b workflow run build.yml --repo "$GITHUB_REPOSITORY" -f ref="$1" -f sha="$2"
+            exit 0
+          }
+
+          # 1. Il tag di versione più recente, se manca la release pubblicata.
+          TAG=$(s api "repos/$SORGENTI/tags?per_page=30" --jq '.[].name' \
+                  | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1 || true)
+          if [ -n "$TAG" ]; then
+            BOZZA=$(s release view "$TAG" --repo "$SORGENTI" --json isDraft --jq .isDraft 2>/dev/null || echo mancante)
+            if [ "$BOZZA" != "false" ] && ! grep -q "^Build $TAG " <<<"$FATTE"; then
+              SHA=$(s api "repos/$SORGENTI/commits/$TAG" --jq '.sha[0:7]')
+              avvia "$TAG" "$SHA"
+            fi
+          fi
+
+          # 2. L'ultimo commit di main.
+          SHA=$(s api "repos/$SORGENTI/commits/main" --jq '.sha[0:7]')
+          if ! grep -qx "Build main $SHA" <<<"$FATTE"; then
+            avvia main "$SHA"
+          fi
+          echo "Niente da costruire."

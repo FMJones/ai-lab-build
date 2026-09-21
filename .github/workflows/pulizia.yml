@@ -1,0 +1,36 @@
+name: Pulizia
+
+# Ogni lunedì toglie la roba vecchia (esecuzioni, Artifacts, cache, pacchetti
+# delle versioni vecchie) dal repository dei sorgenti e da questo: vedi
+# scripts/pulizia.sh. Con "prova" mostra solo cosa toglierebbe.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      prova:
+        description: "Solo mostrare cosa toglierebbe"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+
+concurrency:
+  group: pulizia
+  cancel-in-progress: false
+
+jobs:
+  pulisci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pulisci
+        env:
+          TOKEN_SORGENTI: ${{ secrets.SORGENTI_TOKEN }}
+          TOKEN_BUILD: ${{ github.token }}
+          PROVA: ${{ inputs.prova }}
+        run: |
+          if [ "$PROVA" = "true" ]; then scripts/pulizia.sh --prova; else scripts/pulizia.sh; fi

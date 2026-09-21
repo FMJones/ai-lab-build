@@ -1,0 +1,373 @@
+name: Build installer
+
+# Compila gli installer di AI-Lab per macOS, Windows e Linux.
+#
+# Perché in questo repository (pubblico) e non in quello dei sorgenti
+# (privato): sui repository pubblici i runner standard di GitHub sono
+# GRATUITI e senza limite di minuti, macOS compreso; sui privati i minuti
+# del piano gratuito finiscono in pochi giorni. Qui c'è solo la "ricetta":
+# i sorgenti si scaricano al volo dal repository privato con un token, si
+# compilano, e i pacchetti tornano come asset della release PRIVATA. Niente
+# Actions Artifacts (quota inaffidabile). L'output dei passi che toccano i
+# sorgenti non finisce nei log (pubblici): vedi scripts/silenzioso.sh.
+#
+# Lo avvia "Cerca novità" (ogni mezz'ora) con:
+#   ref = main            -> build di prova, release "prova-installer"
+#   ref = tag "vX.Y.Z"    -> release vera, in bozza finché ci sono tutti i pacchetti
+run-name: Build ${{ inputs.ref }} ${{ inputs.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "main oppure un tag (v3.3.1)"
+        required: true
+      sha:
+        description: "Commit (7 caratteri), solo per riconoscere la build"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  SORGENTI: FMJones/ai-lab
+  REF: ${{ inputs.ref }}
+  AILAB_VERSIONE: ${{ startsWith(inputs.ref, 'v') && inputs.ref || '' }}
+  # Le release del repo privato sono il posto dei pacchetti: il tag per una
+  # versione vera, "prova-installer" per le build da main.
+  DESTINAZIONE: ${{ startsWith(inputs.ref, 'v') && inputs.ref || 'prova-installer' }}
+
+jobs:
+  # ---- Bozza della release (solo per i tag) ----
+  bozza:
+    name: Bozza della release
+    if: startsWith(inputs.ref, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dei sorgenti (per le note)
+        uses: actions/checkout@v4
+        with:
+          repository: FMJones/ai-lab
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SORGENTI_TOKEN }}
+          persist-credentials: false
+
+      - name: Scrivi le note e crea (o aggiorna) la bozza
+        env:
+          GH_TOKEN: ${{ secrets.SORGENTI_TOKEN }}
+        run: |
+          # Prima le novità: il messaggio del tag annotato. Un tag senza
+          # messaggio lascia solo la tabella dei pacchetti.
+          : > note.md
+          OGG=$(gh api "repos/$SORGENTI/git/ref/tags/$REF" \
+                  --jq '.object.type + " " + .object.sha' 2>/dev/null || true)
+          if [ "${OGG%% *}" = "tag" ]; then
+            gh api "repos/$SORGENTI/git/tags/${OGG#* }" --jq .message \
+              | python3 installer/note_release.py > note.md || : > note.md
+            [ -s note.md ] && echo >> note.md
+          fi
+          { echo "## Pacchetti"
+            echo
+            echo "| Sistema | File | Come si installa |"
+            echo "|---|---|---|"
+            echo "| macOS | AI-Lab-Installer-macOS.dmg | Apri il .dmg, poi tasto destro sull'app -> Apri |"
+            echo "| Windows | AI-Lab-Installer-Windows.exe | Doppio clic sull'.exe |"
+            echo "| Debian/Ubuntu | AI-Lab-Installer-Linux.deb | Doppio clic, oppure \`sudo dpkg -i\` |"
+            echo "| Altre distribuzioni Linux | AI-Lab-Installer-Linux.tar.gz | Scompatta ed esegui \"AI-Lab Installer\" |"
+            echo
+            echo "Scarica **un solo file**, quello del tuo sistema. Dentro c'è già tutto AI-Lab,"
+            echo "compilato: non serve installare Python. L'installer **verifica** che cosa è già"
+            echo "presente (Ollama, i modelli) e non riscarica nulla di ciò che c'è già."
+            echo "Poi **riconosce il computer** e propone il modello AI che ci gira meglio."
+            echo
+            echo "> I pacchetti non sono firmati: alla prima apertura macOS e Windows mostrano"
+            echo "> un avviso di sicurezza. Su macOS si aggira con tasto destro -> Apri, su"
+            echo "> Windows con «Ulteriori informazioni» -> «Esegui comunque»."
+          } >> note.md
+          if gh release view "$REF" --repo "$SORGENTI" >/dev/null 2>&1; then
+            gh release edit "$REF" --repo "$SORGENTI" --draft --notes-file note.md
+          else
+            gh release create "$REF" --repo "$SORGENTI" \
+              --title "AI-Lab $REF" --notes-file note.md --draft
+          fi
+
+  build:
+    name: Installer (${{ matrix.nome }})
+    needs: bozza
+    # Su main "bozza" si salta apposta: senza questo "if" esplicito, un bisogno
+    # saltato fa saltare anche questo job. Deve solo fermarsi se "bozza" fallisce.
+    if: always() && (needs.bozza.result == 'success' || needs.bozza.result == 'skipped')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nome: macOS
+            runner: macos-latest
+          - nome: Windows
+            runner: windows-latest
+          - nome: Linux
+            runner: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SORGENTI_TOKEN }}
+
+    steps:
+      - name: Checkout della ricetta
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Checkout dei sorgenti (privati)
+        uses: actions/checkout@v4
+        with:
+          repository: FMJones/ai-lab
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SORGENTI_TOKEN }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Il wizard è Tkinter: senza tkinter il pacchetto si costruisce lo stesso
+      # ma poi non parte. Su Linux servono le librerie Tcl/Tk di sistema.
+      - name: Librerie Tcl/Tk (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk tk
+
+      # Meglio fallire qui, forte e chiaro, che pubblicare un installer che
+      # all'apertura mostra una finestra vuota (è quello che fa Tk 8.5).
+      - name: Controlla Tkinter
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion); assert tkinter.TkVersion >= 8.6, 'serve Tk 8.6+'"
+
+      - name: Installa PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller certifi
+
+      # Senza certificati nel pacchetto, su un computer appena installato ogni
+      # download fallisce con CERTIFICATE_VERIFY_FAILED: meglio fermarsi qui.
+      - name: Controlla certifi
+        run: python -c "import certifi, os; assert os.path.isfile(certifi.where()); print('certifi ok')"
+
+      - name: Librerie dell'app e strumenti di compilazione
+        run: python -m pip install cython setuptools pywebview openpyxl python-docx icalendar recurring_ical_events pdfminer.six keyring certifi tzdata numpy pywhispercpp sounddevice pystray pillow
+
+      # Il programma vero, compilato: il nucleo e la licenza diventano codice
+      # macchina (Cython), e con le librerie e un Python suo diventano un
+      # programma autonomo (PyInstaller). Lo script lancia anche l'autotest del
+      # programma prodotto: se manca una libreria, la build si ferma qui.
+      - name: Compila il programma (codice macchina)
+        shell: bash
+        working-directory: src
+        run: |
+          source "$GITHUB_WORKSPACE/ci/scripts/silenzioso.sh"
+          silenzioso compila python installer/compila_app.py
+
+      - name: Build eseguibile
+        shell: bash
+        working-directory: src
+        run: |
+          source "$GITHUB_WORKSPACE/ci/scripts/silenzioso.sh"
+          silenzioso build python installer/build.py
+
+      - name: Controlla che il pacchetto sia stato prodotto
+        shell: bash
+        working-directory: src
+        run: |
+          ls dist/
+          test -n "$(ls -A dist/)" || { echo "dist/ è vuota: build fallita"; exit 1; }
+
+      # ---- Firma macOS (solo se i certificati sono configurati come secret) ----
+      - name: Firma app (macOS)
+        if: runner.os == 'macOS'
+        working-directory: src
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          APP="dist/AI-Lab Installer.app"
+          if [ -z "$MACOS_CERT_P12_BASE64" ] || [ ! -d "$APP" ]; then
+            echo "Nessun certificato macOS configurato (o app assente): salto la firma."
+            exit 0
+          fi
+          KP="ailab-ci-$RANDOM"
+          security create-keychain -p "$KP" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KP" build.keychain
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > cert.p12
+          security import cert.p12 -k build.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" build.keychain
+          codesign --deep --force --options runtime --timestamp \
+            --sign "$MACOS_SIGN_IDENTITY" "$APP"
+          echo "App firmata."
+
+      # ---- Impacchettamento per sistema ----
+      - name: Pacchetto macOS (.dmg)
+        if: runner.os == 'macOS'
+        working-directory: src/dist
+        run: |
+          if [ -d "AI-Lab Installer.app" ]; then
+            hdiutil create -volname "AI-Lab Installer" \
+              -srcfolder "AI-Lab Installer.app" -ov -format UDZO \
+              "AI-Lab-Installer-macOS.dmg"
+          else
+            # ripiego: zip dell'eseguibile onefile
+            zip -r "AI-Lab-Installer-macOS.zip" "AI-Lab Installer"
+          fi
+
+      - name: Notarizza (macOS)
+        if: runner.os == 'macOS'
+        working-directory: src
+        env:
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+          AC_API_KEY_P8_BASE64: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+        run: |
+          DMG="dist/AI-Lab-Installer-macOS.dmg"
+          if [ -z "$AC_API_KEY_P8_BASE64" ] || [ ! -f "$DMG" ]; then
+            echo "Notarizzazione non configurata (o .dmg assente): salto."
+            exit 0
+          fi
+          echo "$AC_API_KEY_P8_BASE64" | base64 --decode > ac_key.p8
+          xcrun notarytool submit "$DMG" --key ac_key.p8 \
+            --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" --wait
+          xcrun stapler staple "$DMG"
+          echo "DMG notarizzato e stapled."
+
+      # ---- Firma Windows (solo se il certificato è configurato come secret) ----
+      - name: Firma exe (Windows)
+        if: runner.os == 'Windows'
+        working-directory: src
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERT_PFX_BASE64) {
+            Write-Host "Nessun certificato Windows configurato: salto la firma."
+            exit 0
+          }
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1
+          & $signtool.FullName sign /f cert.pfx /p $env:WINDOWS_CERT_PASSWORD `
+            /tr http://timestamp.digicert.com /td sha256 /fd sha256 "dist/AI-Lab Installer.exe"
+          Write-Host "Eseguibile firmato."
+
+      # Un file solo, da scaricare e aprire: l'.exe, non uno zip con dentro l'.exe.
+      - name: Pacchetto Windows (.exe)
+        if: runner.os == 'Windows'
+        working-directory: src/dist
+        run: Copy-Item "AI-Lab Installer.exe" "AI-Lab-Installer-Windows.exe"
+
+      - name: Pacchetto Linux (.deb e .tar.gz)
+        if: runner.os == 'Linux'
+        working-directory: src/dist
+        run: |
+          chmod +x "AI-Lab Installer" || true
+          tar -czf "AI-Lab-Installer-Linux.tar.gz" "AI-Lab Installer"
+
+          # .deb: su Debian/Ubuntu si installa con doppio clic (o "sudo dpkg -i")
+          # e compare nel menu delle applicazioni. Il .tar.gz resta per le altre
+          # distribuzioni. L'eseguibile è autonomo: Python e Tk sono già dentro.
+          PKG=ailab-installer
+          VER="${AILAB_VERSIONE#v}"
+          case "$VER" in ''|*[!0-9.]*) VER=0.0.0 ;; esac
+          R="deb/$PKG"
+          ICONE="$R/usr/share/icons/hicolor/512x512/apps"
+          mkdir -p "$R/DEBIAN" "$R/usr/bin" "$R/usr/share/applications" "$ICONE"
+          cp "AI-Lab Installer" "$R/usr/bin/ailab-installer"
+          chmod 755 "$R/usr/bin/ailab-installer"
+          # Su Linux l'icona non sta dentro l'eseguibile: è un file a parte a
+          # cui il .desktop fa riferimento per nome, senza estensione.
+          cp "$GITHUB_WORKSPACE/src/installer/assets/icona.png" "$ICONE/ailab-installer.png"
+          { echo "Package: $PKG"
+            echo "Version: $VER"
+            echo "Section: utils"
+            echo "Priority: optional"
+            echo "Architecture: amd64"
+            echo "Recommends: python3"
+            echo "Maintainer: AI-Lab <marcocucca6@gmail.com>"
+            echo "Description: Installazione di AI-Lab"
+            echo " Installa AI-Lab, Ollama e i modelli scelti, dopo aver"
+            echo " verificato cosa è già presente sul computer."
+          } > "$R/DEBIAN/control"
+          { echo "[Desktop Entry]"
+            echo "Type=Application"
+            echo "Name=Installazione di AI-Lab"
+            echo "Exec=/usr/bin/ailab-installer"
+            echo "Icon=ailab-installer"
+            echo "Categories=Utility;"
+            echo "Terminal=false"
+          } > "$R/usr/share/applications/ailab-installer.desktop"
+          dpkg-deb --build --root-owner-group "$R" "AI-Lab-Installer-Linux.deb"
+          dpkg-deb --info "AI-Lab-Installer-Linux.deb"
+
+      # I pacchetti vanno come asset della release privata (mai Artifacts):
+      # per un tag sulla release della versione, per main su "prova-installer".
+      - name: Carica gli installer sulla release privata
+        shell: bash
+        working-directory: src/dist
+        run: |
+          CANDIDATI=(AI-Lab-Installer-macOS.dmg AI-Lab-Installer-macOS.zip \
+                     AI-Lab-Installer-Windows.exe \
+                     AI-Lab-Installer-Linux.tar.gz AI-Lab-Installer-Linux.deb)
+          FILE=()
+          for f in "${CANDIDATI[@]}"; do [ -f "$f" ] && FILE+=("$f"); done
+          test "${#FILE[@]}" -gt 0 || { echo "nessun installer da caricare"; exit 1; }
+          if ! gh release view "$DESTINAZIONE" --repo "$SORGENTI" >/dev/null 2>&1; then
+            gh release create "$DESTINAZIONE" --repo "$SORGENTI" --prerelease \
+              --title "AI-Lab — build di prova" \
+              --notes "Ultima build di prova da main: non è una versione pubblicata, si riscrive a ogni commit."
+          fi
+          gh release upload "$DESTINAZIONE" "${FILE[@]}" --repo "$SORGENTI" --clobber
+
+      # Il programma compilato da solo: è il pacchetto degli aggiornamenti
+      # automatici (installer/pubblica_aggiornamento.py lo scarica dalla release
+      # di questo stesso tag, per firmarlo e pubblicarlo).
+      - name: Carica il programma (aggiornamenti)
+        if: startsWith(inputs.ref, 'v')
+        shell: bash
+        working-directory: src
+        run: |
+          shopt -s nullglob
+          FILE=(build/programma/programma-*.tar.gz)
+          test "${#FILE[@]}" -gt 0 || { echo "nessun pacchetto programma da caricare"; exit 1; }
+          gh release upload "$DESTINAZIONE" "${FILE[@]}" --repo "$SORGENTI" --clobber
+
+  # ---- Finalizza: solo se TUTTE le build sono andate bene ----
+  # Meglio una release ferma in bozza che una pubblicata con pacchetti mancanti.
+  finalizza:
+    name: Chiudi la build
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SORGENTI_TOKEN }}
+    steps:
+      - name: Controlla che ci siano tutti i pacchetti attesi
+        run: |
+          ASSET=$(gh release view "$DESTINAZIONE" --repo "$SORGENTI" --json assets --jq '.assets[].name')
+          echo "$ASSET"
+          for ATTESO in AI-Lab-Installer-Windows.exe AI-Lab-Installer-Linux.deb AI-Lab-Installer-Linux.tar.gz; do
+            echo "$ASSET" | grep -qx "$ATTESO" || { echo "manca $ATTESO"; exit 1; }
+          done
+          echo "$ASSET" | grep -qx "AI-Lab-Installer-macOS.dmg" || \
+            echo "$ASSET" | grep -qx "AI-Lab-Installer-macOS.zip" || \
+            { echo "manca il pacchetto macOS"; exit 1; }
+
+      - name: Togli lo stato di bozza (tag)
+        if: startsWith(inputs.ref, 'v')
+        run: gh release edit "$REF" --repo "$SORGENTI" --draft=false
+
+      - name: Annota il commit costruito (main)
+        if: "!startsWith(inputs.ref, 'v')"
+        run: |
+          gh release edit prova-installer --repo "$SORGENTI" \
+            --notes "Ultima build di prova da main (commit ${{ inputs.sha }}, $(date -u +%F' '%H:%M) UTC): non è una versione pubblicata, si riscrive a ogni commit."
